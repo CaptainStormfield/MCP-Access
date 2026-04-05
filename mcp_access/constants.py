@@ -166,5 +166,5 @@ OUTPUT_FORMATS: dict[str, str] = {
 # ---------------------------------------------------------------------------
 CONTROL_SEARCH_PROPS = frozenset({
     "ControlSource", "RecordSource", "RowSource", "DefaultValue", "ValidationRule",
-    "SourceObject",
+    "SourceObject", "LinkChildFields", "LinkMasterFields",
 })
