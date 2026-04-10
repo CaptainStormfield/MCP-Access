@@ -232,6 +232,7 @@ def ac_decompile_compact(db_path: str) -> dict:
         )
     except Exception:
         pass
+    time.sleep(1)  # Allow Windows to evict the dead process's ROT entry
 
     decompile_size = os.path.getsize(resolved)
 
