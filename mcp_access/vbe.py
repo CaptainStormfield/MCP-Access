@@ -24,25 +24,34 @@ from .helpers import text_matches, read_tmp
 
 
 # ---------------------------------------------------------------------------
-# Property procedure helpers (Bug fix: kind=0 vs kind=3)
+# Property procedure helpers
 # ---------------------------------------------------------------------------
 # VBE ProcStartLine/ProcBodyLine/ProcCountLines/ProcOfLine require a ``kind``
-# argument: 0 = vbext_pk_Proc (Sub/Function), 3 = vbext_pk_Property
-# (Property Get/Let/Set).  Using the wrong kind raises an error.
-# These helpers try kind=0 first (most common) and fall back to kind=3.
+# argument matching the exact procedure variant:
+#   0 = vbext_pk_Proc  (Sub / Function, and also finds Property Get in practice)
+#   1 = vbext_pk_Get   (Property Get)
+#   2 = vbext_pk_Let   (Property Let)
+#   3 = vbext_pk_Set   (Property Set)
+# Using the wrong kind raises a COM error.  _proc_kind tries all four in order
+# so that Let-only and Set-only properties are found correctly.
 
 _VBEXT_PK_PROC = 0
-_VBEXT_PK_PROPERTY = 3
+_VBEXT_PK_GET  = 1
+_VBEXT_PK_LET  = 2
+_VBEXT_PK_SET  = 3
+
+_ALL_PROC_KINDS = (_VBEXT_PK_PROC, _VBEXT_PK_GET, _VBEXT_PK_LET, _VBEXT_PK_SET)
 
 
 def _proc_kind(cm, name: str) -> int:
-    """Return the correct VBE ``kind`` constant for *name* (0 or 3)."""
-    try:
-        cm.ProcStartLine(name, _VBEXT_PK_PROC)
-        return _VBEXT_PK_PROC
-    except Exception:
-        cm.ProcStartLine(name, _VBEXT_PK_PROPERTY)  # let it raise if also fails
-        return _VBEXT_PK_PROPERTY
+    """Return the correct VBE kind constant for *name* (0=Proc, 1=Get, 2=Let, 3=Set)."""
+    for kind in _ALL_PROC_KINDS:
+        try:
+            cm.ProcStartLine(name, kind)
+            return kind
+        except Exception:
+            pass
+    raise RuntimeError(f"Procedure '{name}' not found")
 
 
 def _proc_bounds(cm, name: str):
@@ -56,13 +65,14 @@ def _proc_bounds(cm, name: str):
 
 def _proc_of_line(cm, line: int) -> str:
     """Return the procedure name that owns *line*, or ``""``."""
-    try:
-        return cm.ProcOfLine(line, _VBEXT_PK_PROC)
-    except Exception:
+    for kind in _ALL_PROC_KINDS:
         try:
-            return cm.ProcOfLine(line, _VBEXT_PK_PROPERTY)
+            name = cm.ProcOfLine(line, kind)
+            if name:
+                return name
         except Exception:
-            return ""
+            pass
+    return ""
 
 
 # ---------------------------------------------------------------------------
@@ -364,28 +374,57 @@ def ac_vbe_module_info(
     all_code = _cm_all_code(cm, cache_key)
     all_lines = all_code.splitlines()
     total = len(all_lines)
+    # Map the regex-detected keyword to the VBE kind constant so each property
+    # variant (Get, Let, Set) is looked up with the correct kind rather than
+    # relying on _proc_kind's first-match heuristic.
+    _KW_TO_KIND = {
+        "property get": _VBEXT_PK_GET,
+        "property let": _VBEXT_PK_LET,
+        "property set": _VBEXT_PK_SET,
+    }
     procs: list[dict] = []
     if total > 0:
-        seen: set[str] = set()
+        # Key is (name.lower(), keyword) so Property Get and Property Let with
+        # the same name are listed as separate entries instead of the Let being
+        # silently dropped.
+        seen: set[tuple] = set()
         for i, raw_line in enumerate(all_lines, start=1):
             m = re.match(
                 r'^(?:Public\s+|Private\s+|Friend\s+)?'
-                r'(?:Function|Sub|Property\s+(?:Get|Let|Set))\s+(\w+)',
+                r'(Property\s+Get|Property\s+Let|Property\s+Set|Function|Sub)\s+(\w+)',
                 raw_line.strip(), re.IGNORECASE,
             )
             if m:
-                pname = m.group(1)
-                if pname in seen:
+                keyword = m.group(1).lower()
+                pname = m.group(2)
+                seen_key = (pname.lower(), keyword)
+                if seen_key in seen:
                     continue
-                seen.add(pname)
+                seen.add(seen_key)
+                kind_hint = _KW_TO_KIND.get(keyword, _VBEXT_PK_PROC)
                 try:
-                    pstart, body, pcount, _kind = _proc_bounds(cm, pname)
-                    # Clamp count to not exceed total_lines
+                    pstart = cm.ProcStartLine(pname, kind_hint)
+                    body = cm.ProcBodyLine(pname, kind_hint)
+                    pcount = cm.ProcCountLines(pname, kind_hint)
                     pcount = min(pcount, total - pstart + 1)
                     procs.append({"name": pname, "start_line": pstart,
                                   "body_line": body, "count": pcount})
                 except Exception:
-                    procs.append({"name": pname, "start_line": i})
+                    # kind-specific VBE lookup failed (Access VBA quirk: kind=1 is
+                    # unreliable; kind=2 fails for Let-only properties without a Get).
+                    # Derive count by scanning forward from the declaration line to
+                    # the matching End keyword.  start_line == body_line here (no
+                    # preceding-comment info available without a working ProcStartLine).
+                    pcount = 1
+                    for j in range(i - 1, total):
+                        if re.match(
+                            r'\s*End\s+(?:Property|Sub|Function)\s*$',
+                            all_lines[j], re.IGNORECASE,
+                        ):
+                            pcount = j - (i - 1) + 1
+                            break
+                    procs.append({"name": pname, "start_line": i,
+                                  "body_line": i, "count": pcount})
     return {"total_lines": total, "procs": procs}
 
 
