@@ -2,7 +2,7 @@
 
 **Give any AI assistant full control over Microsoft Access databases.**
 
-Create forms, write VBA, design tables, manage controls, run queries, build relationships, and edit every corner of an `.accdb` — all through natural language. 61 tools that turn Access into something you can *talk to*.
+Create forms, write VBA, design tables, manage controls, run queries, build relationships, and edit every corner of an `.accdb` — all through natural language. 62 tools that turn Access into something you can *talk to*.
 
 No Access expertise required. Just describe what you want.
 
@@ -318,6 +318,45 @@ Compatible with any MCP-compliant client (Cursor, Windsurf, Continue, etc.).
 The MCP Python SDK (v1.26.0) has a catch-all `except Exception` in `mcp/shared/session.py` that swallows real errors and returns a generic `-32602` code with no detail. A local patch is applied to this machine that includes the actual exception and traceback in the error response. If you upgrade the `mcp` package, re-apply the patch — see `CLAUDE.md` for details.
 
 ## Changelog
+
+### v0.7.29 — 2026-04-24
+
+**Audit pass** — bugs and UX rough edges found during a full-package review:
+
+- **`access_vbe_patch_proc` could silently drop patches on form/report code-behind**: the function invalidated the VBE text cache but never called `DoCmd.Save` after writing, unlike `access_vbe_replace_proc` / `access_vbe_replace_lines` / `access_vbe_append`. On forms/reports this meant the object's dirty flag was never raised, so the edits could be discarded on close. Fix: added the same `app.DoCmd.Save(obj_type_code, object_name)` block that the other three writers use.
+- **`access_delete_relationship` now requires `confirm=true`**: deleting a relationship is irreversible and was the only destructive operation in the package without a confirmation guard. Aligned with `access_execute_sql`'s `confirm_destructive` pattern.
+- **Destructive-SQL detection ignored leading comments**: `-- note\nDELETE FROM t` and `/* prefix */ DROP TABLE t` passed through the `startswith("DELETE"|"DROP"|...)` check. New `_sql_effective_prefix()` walks past leading `--` line comments and `/* ... */` block comments before prefix-matching, in both `ac_execute_sql` and `ac_execute_batch`.
+- **`access_output_report` now refuses to clobber existing files unless `overwrite=true`**: Access `DoCmd.OutputTo` silently overwrites, which can lose an earlier export if the same `output_path` is reused.
+- **`access_ui_type` now uses `WM_UNICHAR` for non-ASCII characters**: accented Spanish (á, é, ñ), Cyrillic, CJK, and other code points >127 were being sent via `WM_CHAR` with `ord(ch)`, which routes through the window's ANSI code page and produces mojibake on English locales. Characters ≤127 still use `WM_CHAR` so keyboard shortcuts work the same.
+- **`access_vbe_find` with `proc_name=""` no longer errors**: some MCP clients send `""` instead of omitting the argument when a procedure-scope filter is not wanted. Now treated as "search the whole module".
+- **Hardened `GetActiveObject` attach**: a round-trip property read now validates that the returned COM reference points at a live Access process before `_attached=True` is set. Zombie marshalled references from a dying process now fall through to `DispatchEx` cleanly.
+- **Deduplicated `_split_code_behind`**: was byte-identical in `code.py` and `controls.py`, now lives in `helpers.split_code_behind` with backwards-compatible re-exports at both old names.
+- **Minor**: `"Error en %s"` log message in dispatcher translated to English; removed an unused `DB_SEE_CHANGES` import in `database.py`.
+
+Tool count unchanged (62). Documented false positives from the review (type-name case mismatch in `ac_table_info`, silent-typo in `ac_set_control_props`) were verified against the code and turned out to be non-issues.
+
+### v0.7.28 — 2026-04-24
+
+**Polish of `access_find_definition`** (v0.7.27 follow-up):
+
+- **Const values were contaminated by trailing comments**: `Public Const MAX_ROWS = 100  ' default page size` returned `value = "100  ' default page size"` instead of `"100"`. The naive `split("'", 1)[0]` stripper also broke on string literals with apostrophes like `Public Const Name = "O'Brien"`, truncating the value at the inner `'`. Fix: new `_strip_trailing_vba_comment()` helper that respects `"..."` string literals (same state machine as `_split_top_level_commas`), applied at all value-extraction sites.
+- **`Default` property modifier not detected**: `Public Default Property Get Item(...)` — valid VBA on class modules with a default member — was invisible to the tool. `_FD_PROC_RE` only allowed `Static`. Fix: widened to `(?:(?:Static|Default)\s+)?`.
+- **Line continuations not joined**: `Public Const FOO As Long = _\n    &H1000` returned `value = "_"` (only the first physical line was parsed). `Public Declare PtrSafe Function SendMessage _\n    Lib "user32" …` had the same problem. Fix: new `_join_continuations()` helper folds trailing-`_` continuations into single logical statements before matching. The reported `line` still points at the first physical line of the statement.
+- **`scan_types` parameter**: optionally restrict the scan to any subset of `["module", "form", "report"]`. Passing `scan_types=["module"]` skips form/report code-behind and is **≈7× faster** on cold scans, because form/report scanning triggers a Design-view open/close round-trip per object when the VBComponent cache is empty. Useful when you know the target is a public declaration in a standard module — as Tom pointed out in his original request: *"All public enums are defined in modGlobal"*.
+- **`first_only` parameter**: stop at the first match. Good for unique names in big databases.
+- **`subkind` cleanup**: `subkind` is now only emitted when it carries information beyond `kind` — i.e. on `property` (Get/Let/Set) and `declare` (Sub vs Function). For `sub` and `function` it was redundant with `kind` and has been removed.
+
+### v0.7.27 — 2026-04-24
+
+**New tool** — thanks to [@TvanStiphout-Home](https://github.com/TvanStiphout-Home):
+
+- **`access_find_definition`** — "Go To Definition" for VBA symbols, the mirror of `access_find_usages`. Scans every standard module, form code-behind and report code-behind for DECLARATIONS of a given name and returns where each one lives (object, line, full declaration, scope, and for constants the literal value). Detects `Const` (including multi-const lines like `Const A = 1, B = 2`), `Enum` + enum members, `Type` + type fields, `Sub`, `Function`, `Property Get/Let/Set`, `Declare` (Win32 API), and module-level `Dim/Public/Private/Global` variables. Locals inside a `Sub`/`Function`/`Property` are correctly skipped — they are not definitions in the "go to" sense. Case-insensitive by default (VBA is), with an optional `kinds` whitelist to narrow results (e.g. `["const","enum_member"]` when resolving a symbol used as a numeric literal like `dbAccess`). Previously the agent had to spawn throw-away VBA helpers with `MsgBox` just to discover the value of a named constant — this tool makes that unnecessary.
+
+### v0.7.26 — 2026-04-23
+
+**Bug fix** — thanks to [@TvanStiphout-Home](https://github.com/TvanStiphout-Home) ([#25](https://github.com/unmateria/MCP-Access/issues/25)):
+
+- **`access_compile_vba` spawned a second Access instance when user had Access open**: Follow-up to v0.7.25. The `GetActiveObject` attach fix applied to `_Session._launch()`, but the auto-decompile path in `_Session._decompile()` (triggered on first compile per session) and `ac_decompile_compact()` still unconditionally called `cls._app.Quit(1)` and re-launched — killing the user's attached Access and spawning a fresh one via `DispatchEx`. Fix: new `_Session._attached` flag tracks whether we attached (`GetActiveObject`) or launched (`DispatchEx`). When attached, `/decompile` now releases the file lock via `CloseCurrentDatabase()` only, never calls `Quit()`, and reuses the same COM reference after the subprocess finishes. `atexit` handler also skips `Quit()` when attached so MCP shutdown doesn't kill the user's Access. Defence-in-depth PID-diff cleanup (`_list_msaccess_pids()` before vs. after the subprocess) kills any forked `msaccess.exe` children that escape `taskkill /T`. Refuses to decompile a path when the user has a **different** DB open, instead of silently closing their unsaved work.
 
 ### v0.7.25 — 2026-04-14
 

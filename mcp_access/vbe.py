@@ -582,7 +582,9 @@ def ac_vbe_find(
     # Determine search range
     search_start = 1
     search_end = len(all_code.splitlines())
-    if proc_name:
+    # Treat whitespace-only / empty proc_name as "search the whole module"
+    # (callers that omit the arg send "" rather than None via MCP schema).
+    if proc_name and proc_name.strip():
         try:
             p_start, _p_body, p_count, _p_kind = _proc_bounds(cm, proc_name)
             search_start = p_start
@@ -961,6 +963,13 @@ def ac_vbe_patch_proc(
 
     # Invalidate cache
     _vbe_code_cache.pop(cache_key, None)
+    # Persist VBE changes to .accdb — without this, patches to form/report
+    # code-behind can be lost because the object's dirty flag is not set.
+    try:
+        obj_type_code = AC_TYPE.get(object_type, 5)
+        app.DoCmd.Save(obj_type_code, object_name)
+    except Exception:
+        pass
     new_total = cm.CountOfLines
     try:
         new_count = cm.ProcCountLines(proc_name, kind) if applied > 0 else 0
@@ -1033,3 +1042,457 @@ def ac_vbe_append(
     if health:
         result += f"\n" + "\n".join(health)
     return result
+
+
+# ---------------------------------------------------------------------------
+# Find definition — "Go To Definition" for VBA symbols
+# (requested by Tom — @TvanStiphout-Home, thanks!)
+# ---------------------------------------------------------------------------
+
+_FD_PROC_RE = re.compile(
+    r'^\s*(?:(Public|Private|Friend|Global|Static)\s+)?'
+    r'(?:(?:Static|Default)\s+)?'
+    r'(Sub|Function|Property\s+Get|Property\s+Let|Property\s+Set)\s+(\w+)',
+    re.IGNORECASE,
+)
+_FD_END_PROC_RE = re.compile(r'^\s*End\s+(Sub|Function|Property)\b', re.IGNORECASE)
+_FD_CONST_RE = re.compile(r'^\s*(?:(?:Public|Private|Global)\s+)?Const\s+', re.IGNORECASE)
+_FD_ENUM_RE = re.compile(r'^\s*(?:(Public|Private)\s+)?Enum\s+(\w+)', re.IGNORECASE)
+_FD_END_ENUM_RE = re.compile(r'^\s*End\s+Enum\b', re.IGNORECASE)
+_FD_TYPE_RE = re.compile(r'^\s*(?:(Public|Private)\s+)?Type\s+(\w+)', re.IGNORECASE)
+_FD_END_TYPE_RE = re.compile(r'^\s*End\s+Type\b', re.IGNORECASE)
+_FD_DECLARE_RE = re.compile(
+    r'^\s*(?:(Public|Private)\s+)?Declare\s+(?:PtrSafe\s+)?(Sub|Function)\s+(\w+)',
+    re.IGNORECASE,
+)
+# Variable decl: starts with Public/Private/Global/Dim, followed by something
+# that is NOT Const/Enum/Type/Sub/Function/Property/Declare.
+_FD_VAR_RE = re.compile(
+    r'^\s*(Public|Private|Global|Dim)\s+'
+    r'(?!Const\b|Enum\b|Type\b|Sub\b|Function\b|Property\b|Declare\b)',
+    re.IGNORECASE,
+)
+_FD_ENUM_MEMBER_RE = re.compile(r'^\s*(\w+)(?:\s*=\s*([^\']+?))?\s*(?:\'.*)?$')
+_FD_TYPE_FIELD_RE = re.compile(
+    r'^\s*(\w+)(?:\([^)]*\))?\s+As\s+(.+?)(?:\s*\'.*)?$', re.IGNORECASE,
+)
+
+
+def _split_top_level_commas(s: str) -> list[str]:
+    """Split string by commas that are not inside parens or double quotes.
+
+    Note on VBA's "" escape: an embedded double-quote inside a VBA string is
+    written as "". This naive in_quote toggle flip-flops twice on each "",
+    but the net state at the end of a well-formed string is correct, and
+    real commas only appear outside strings — so splits land in the right
+    place for any valid VBA source.
+    """
+    parts: list[str] = []
+    buf: list[str] = []
+    depth = 0
+    in_quote = False
+    for ch in s:
+        if ch == '"':
+            in_quote = not in_quote
+            buf.append(ch)
+        elif ch == '(' and not in_quote:
+            depth += 1
+            buf.append(ch)
+        elif ch == ')' and not in_quote:
+            depth -= 1
+            buf.append(ch)
+        elif ch == ',' and not in_quote and depth == 0:
+            parts.append("".join(buf))
+            buf = []
+        else:
+            buf.append(ch)
+    if buf:
+        parts.append("".join(buf))
+    return parts
+
+
+def _strip_trailing_vba_comment(line: str) -> str:
+    """Strip a trailing VBA comment (' ...) from a line, respecting string
+    literals. Returns the line without the comment and without trailing
+    whitespace.
+
+    VBA comments start with an apostrophe that is OUTSIDE any "..." string.
+    Same state machine as _split_top_level_commas.
+    """
+    in_quote = False
+    for i, ch in enumerate(line):
+        if ch == '"':
+            in_quote = not in_quote
+        elif ch == "'" and not in_quote:
+            return line[:i].rstrip()
+    return line.rstrip()
+
+
+def _join_continuations(lines: list[str]) -> list[tuple[int, str]]:
+    """Join VBA line continuations (` _` at end of a line) into single
+    logical lines.
+
+    Returns a list of ``(first_line_number, joined_text)`` tuples, where
+    ``first_line_number`` is the 1-based line number of the FIRST physical
+    line of the logical statement — so downstream reporting still points at
+    where the declaration starts.
+
+    A continuation is a line that, after stripping trailing whitespace and
+    ignoring a trailing VBA comment, ends with ``_`` preceded by whitespace
+    (or is exactly ``_``). Continuations can chain.
+    """
+    result: list[tuple[int, str]] = []
+    i = 0
+    n = len(lines)
+    while i < n:
+        first_idx = i
+        # Build the logical line. We keep going while the CURRENT physical
+        # line (after comment-strip) ends with whitespace + '_'.
+        accumulated_parts: list[str] = []
+        while True:
+            raw = lines[i].rstrip("\r")
+            no_comment = _strip_trailing_vba_comment(raw)
+            cont_match = re.search(r'(?:^|\s)_\s*$', no_comment)
+            if cont_match and i + 1 < n:
+                accumulated_parts.append(no_comment[:cont_match.start()].rstrip())
+                i += 1
+                continue
+            accumulated_parts.append(no_comment)
+            break
+        # First part keeps its leading indentation (regex patterns use ^\s*).
+        # Continuation parts get their leading whitespace trimmed — the join
+        # space takes its place — so "= _\n   &H1000" becomes "= &H1000".
+        pieces = [
+            p if idx == 0 else p.lstrip()
+            for idx, p in enumerate(accumulated_parts)
+        ]
+        joined = " ".join(p for p in pieces if p)
+        result.append((first_idx + 1, joined))
+        i += 1
+    return result
+
+
+def ac_find_definition(
+    db_path: str, symbol: str, kinds: list | None = None,
+    match_case: bool = False,
+    scan_types: list | None = None,
+    first_only: bool = False,
+) -> dict:
+    """
+    "Go To Definition" for VBA symbols — the mirror of ac_find_usages.
+
+    Scans every VBA code module (standard modules, form code-behind, report
+    code-behind) for DECLARATIONS of the given symbol and returns where each
+    one lives (object, line, declaration text, scope).
+
+    Detects:
+      - const          Public/Private/Global Const FOO = ...  (multi on one line OK)
+      - enum           Public/Private Enum MyEnum
+      - enum_member    lines inside an Enum ... End Enum block
+      - type           Public/Private Type MyStruct
+      - type_field     lines inside a Type ... End Type block
+      - sub            [Public|Private] Sub Name(...)
+      - function       [Public|Private] Function Name(...) [As Type]
+      - property       Property Get/Let/Set Name(...)   (incl. Default Property)
+      - declare        [Public|Private] Declare [PtrSafe] Sub/Function Name Lib "..."
+      - variable       module-level Dim/Public/Private/Global NAME [As ...]
+                       (vars inside Sub/Function/Property are NOT reported —
+                       those are locals, not definitions in the "go to" sense).
+
+    Line continuations (` _` at end of line) are joined into a single
+    logical statement before matching, so multi-line declarations resolve
+    correctly. ``line`` always points at the FIRST physical line.
+
+    Args:
+        db_path: path to .accdb/.mdb
+        symbol:  name to resolve (e.g. "dbAccess", "modGlobal", "ccRed")
+        kinds:   optional whitelist, any subset of the 10 kinds above.
+                 Default: all kinds.
+        match_case: VBA is case-insensitive, so default False.
+        scan_types: which object types to scan. Default ["module", "form",
+                    "report"]. Pass ["module"] to skip forms/reports — much
+                    faster on large DBs, since form/report code-behind needs
+                    a Design-view open/close round-trip per object when the
+                    VBComponent cache is cold.
+        first_only: stop after the first match. Good for unique names.
+
+    Returns:
+        {"symbol", "total", "definitions": [ ... ]}
+    """
+    # Lazy import to avoid circular dependency
+    from .code import ac_list_objects
+
+    VALID_KINDS = {
+        "const", "enum", "enum_member", "type", "type_field",
+        "sub", "function", "property", "declare", "variable",
+    }
+    if kinds:
+        bad = [k for k in kinds if k not in VALID_KINDS]
+        if bad:
+            raise ValueError(
+                f"Invalid kind(s) {bad}. Valid: {sorted(VALID_KINDS)}"
+            )
+        kinds_filter = set(kinds)
+    else:
+        kinds_filter = VALID_KINDS
+
+    VALID_SCAN_TYPES = ("module", "form", "report")
+    if scan_types:
+        bad_st = [t for t in scan_types if t not in VALID_SCAN_TYPES]
+        if bad_st:
+            raise ValueError(
+                f"Invalid scan_types {bad_st}. Valid: {list(VALID_SCAN_TYPES)}"
+            )
+        scan_order = tuple(t for t in VALID_SCAN_TYPES if t in scan_types)
+    else:
+        scan_order = VALID_SCAN_TYPES
+
+    if match_case:
+        def name_matches(n: str) -> bool:
+            return n == symbol
+    else:
+        symbol_lower = symbol.lower()
+        def name_matches(n: str) -> bool:
+            return n.lower() == symbol_lower
+
+    app = _Session.connect(db_path)
+    objects = ac_list_objects(db_path, "all")
+    definitions: list[dict] = []
+
+    def _stop() -> bool:
+        return first_only and bool(definitions)
+
+    for obj_type in scan_order:
+        if _stop():
+            break
+        for obj_name in objects.get(obj_type, []):
+            if _stop():
+                break
+            try:
+                cm = _get_code_module(app, obj_type, obj_name)
+                cache_key = f"{obj_type}:{obj_name}"
+                all_code = _cm_all_code(cm, cache_key)
+            except Exception:
+                continue  # skip modules we cannot access
+            if not all_code:
+                continue
+
+            # Fold line continuations; each tuple = (first_physical_line, clean_text).
+            # clean_text already has trailing VBA comments stripped, respecting
+            # "..." string literals — so value-extraction regex can be greedy-safe.
+            logical = _join_continuations(all_code.splitlines())
+            in_proc = False
+            in_enum = False
+            in_type = False
+            current_enum = ""
+            current_type = ""
+
+            for (i, stripped) in logical:
+                if _stop():
+                    break
+                # Inside proc — only watch for End, ignore everything else
+                if in_proc:
+                    if _FD_END_PROC_RE.match(stripped):
+                        in_proc = False
+                    continue
+
+                # Inside enum — every non-empty line is a member
+                if in_enum:
+                    if _FD_END_ENUM_RE.match(stripped):
+                        in_enum = False
+                        current_enum = ""
+                        continue
+                    if not stripped or "enum_member" not in kinds_filter:
+                        continue
+                    m = _FD_ENUM_MEMBER_RE.match(stripped)
+                    if m and name_matches(m.group(1)):
+                        value = (m.group(2) or "").strip()
+                        definitions.append({
+                            "kind": "enum_member",
+                            "object_type": obj_type,
+                            "object_name": obj_name,
+                            "line": i,
+                            "declaration": stripped.strip(),
+                            "parent_enum": current_enum,
+                            "value": value or None,
+                        })
+                        if _stop():
+                            break
+                    continue
+
+                # Inside type — every non-empty "Name As Type" line is a field
+                if in_type:
+                    if _FD_END_TYPE_RE.match(stripped):
+                        in_type = False
+                        current_type = ""
+                        continue
+                    if not stripped or "type_field" not in kinds_filter:
+                        continue
+                    m = _FD_TYPE_FIELD_RE.match(stripped)
+                    if m and name_matches(m.group(1)):
+                        definitions.append({
+                            "kind": "type_field",
+                            "object_type": obj_type,
+                            "object_name": obj_name,
+                            "line": i,
+                            "declaration": stripped.strip(),
+                            "parent_type": current_type,
+                            "as_type": m.group(2).strip(),
+                        })
+                        if _stop():
+                            break
+                    continue
+
+                # Module level — try patterns in order of specificity
+
+                # Enum decl
+                m = _FD_ENUM_RE.match(stripped)
+                if m:
+                    enum_name = m.group(2)
+                    scope = (m.group(1) or "").strip() or None
+                    in_enum = True
+                    current_enum = enum_name
+                    if "enum" in kinds_filter and name_matches(enum_name):
+                        definitions.append({
+                            "kind": "enum",
+                            "object_type": obj_type,
+                            "object_name": obj_name,
+                            "line": i,
+                            "declaration": stripped.strip(),
+                            "scope": scope,
+                        })
+                        if _stop():
+                            break
+                    continue
+
+                # Type decl
+                m = _FD_TYPE_RE.match(stripped)
+                if m:
+                    type_name = m.group(2)
+                    scope = (m.group(1) or "").strip() or None
+                    in_type = True
+                    current_type = type_name
+                    if "type" in kinds_filter and name_matches(type_name):
+                        definitions.append({
+                            "kind": "type",
+                            "object_type": obj_type,
+                            "object_name": obj_name,
+                            "line": i,
+                            "declaration": stripped.strip(),
+                            "scope": scope,
+                        })
+                        if _stop():
+                            break
+                    continue
+
+                # Const decl (possibly multi: Const A = 1, B = 2)
+                if _FD_CONST_RE.match(stripped):
+                    if "const" in kinds_filter:
+                        scope_m = re.match(
+                            r'^\s*(Public|Private|Global)\s+Const',
+                            stripped, re.IGNORECASE,
+                        )
+                        scope = scope_m.group(1) if scope_m else None
+                        rest_m = re.match(
+                            r'^\s*(?:(?:Public|Private|Global)\s+)?Const\s+(.+)$',
+                            stripped, re.IGNORECASE,
+                        )
+                        if rest_m:
+                            for part in _split_top_level_commas(rest_m.group(1)):
+                                sub_m = re.match(
+                                    r'^\s*(\w+)\s*(?:As\s+[\w.]+)?\s*=\s*(.+?)\s*$',
+                                    part, re.IGNORECASE,
+                                )
+                                if sub_m and name_matches(sub_m.group(1)):
+                                    definitions.append({
+                                        "kind": "const",
+                                        "object_type": obj_type,
+                                        "object_name": obj_name,
+                                        "line": i,
+                                        "declaration": stripped.strip(),
+                                        "scope": scope,
+                                        "value": sub_m.group(2).strip(),
+                                    })
+                                    if _stop():
+                                        break
+                    continue
+
+                # Declare decl (Win32 API)
+                m = _FD_DECLARE_RE.match(stripped)
+                if m:
+                    if "declare" in kinds_filter:
+                        scope = (m.group(1) or "").strip() or None
+                        decl_kind = m.group(2)  # Sub or Function
+                        decl_name = m.group(3)
+                        if name_matches(decl_name):
+                            definitions.append({
+                                "kind": "declare",
+                                "subkind": decl_kind,
+                                "object_type": obj_type,
+                                "object_name": obj_name,
+                                "line": i,
+                                "declaration": stripped.strip(),
+                                "scope": scope,
+                            })
+                            if _stop():
+                                break
+                    continue
+
+                # Sub/Function/Property decl
+                m = _FD_PROC_RE.match(stripped)
+                if m:
+                    scope = (m.group(1) or "").strip() or None
+                    proc_kw = re.sub(r'\s+', ' ', m.group(2).strip())
+                    proc_name = m.group(3)
+                    in_proc = True
+                    if proc_kw.lower().startswith("property"):
+                        kind_cat = "property"
+                    elif proc_kw.lower() == "sub":
+                        kind_cat = "sub"
+                    else:
+                        kind_cat = "function"
+                    if kind_cat in kinds_filter and name_matches(proc_name):
+                        entry: dict = {
+                            "kind": kind_cat,
+                            "object_type": obj_type,
+                            "object_name": obj_name,
+                            "line": i,
+                            "declaration": stripped.strip(),
+                            "scope": scope,
+                        }
+                        # subkind only carries extra information for property
+                        # (Get/Let/Set) — for sub/function it's redundant with kind.
+                        if kind_cat == "property":
+                            entry["subkind"] = proc_kw
+                        definitions.append(entry)
+                        if _stop():
+                            break
+                    continue
+
+                # Module-level variable decl
+                if "variable" in kinds_filter and _FD_VAR_RE.match(stripped):
+                    scope_m = re.match(
+                        r'^\s*(Public|Private|Global|Dim)\s+(?:WithEvents\s+)?(.+)$',
+                        stripped, re.IGNORECASE,
+                    )
+                    if scope_m:
+                        scope = scope_m.group(1)
+                        for part in _split_top_level_commas(scope_m.group(2)):
+                            name_m = re.match(r'^\s*(\w+)', part)
+                            if name_m and name_matches(name_m.group(1)):
+                                definitions.append({
+                                    "kind": "variable",
+                                    "object_type": obj_type,
+                                    "object_name": obj_name,
+                                    "line": i,
+                                    "declaration": stripped.strip(),
+                                    "scope": scope,
+                                })
+                                if _stop():
+                                    break
+
+    return {
+        "symbol": symbol,
+        "total": len(definitions),
+        "definitions": definitions,
+    }

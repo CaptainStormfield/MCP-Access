@@ -11,7 +11,7 @@ from .vbe import (
     ac_vbe_get_lines, ac_vbe_get_proc, ac_vbe_module_info,
     ac_vbe_replace_lines, ac_vbe_find, ac_vbe_search_all,
     ac_search_queries, ac_vbe_replace_proc, ac_vbe_patch_proc,
-    ac_vbe_append, ac_find_usages,
+    ac_vbe_append, ac_find_usages, ac_find_definition,
 )
 from .controls import (
     ac_list_controls, ac_get_control, ac_create_control,
@@ -314,6 +314,7 @@ def call_tool_sync(name: str, arguments: dict) -> str:
             result = ac_delete_relationship(
                 arguments["db_path"],
                 arguments["name"],
+                confirm=bool(arguments.get("confirm", False)),
             )
             text = json.dumps(result, ensure_ascii=False, indent=2)
 
@@ -389,6 +390,7 @@ def call_tool_sync(name: str, arguments: dict) -> str:
                 arguments["report_name"],
                 output_path=arguments.get("output_path"),
                 fmt=arguments.get("format", "pdf"),
+                overwrite=bool(arguments.get("overwrite", False)),
             )
             text = json.dumps(result, ensure_ascii=False, indent=2)
 
@@ -509,6 +511,18 @@ def call_tool_sync(name: str, arguments: dict) -> str:
             )
             text = json.dumps(result, ensure_ascii=False, indent=2)
 
+        # -- Find definition (Go To Definition) ---------------------------
+        elif name == "access_find_definition":
+            result = ac_find_definition(
+                arguments["db_path"],
+                arguments["symbol"],
+                kinds=arguments.get("kinds"),
+                match_case=bool(arguments.get("match_case", False)),
+                scan_types=arguments.get("scan_types"),
+                first_only=bool(arguments.get("first_only", False)),
+            )
+            text = json.dumps(result, ensure_ascii=False, indent=2)
+
         # -- Batch SQL ----------------------------------------------------
         elif name == "access_execute_batch":
             result = ac_execute_batch(
@@ -582,7 +596,7 @@ def call_tool_sync(name: str, arguments: dict) -> str:
             text = f"ERROR: unknown tool '{name}'"
 
     except Exception as exc:
-        log.error("Error en %s: %s", name, exc, exc_info=True)
+        log.error("Error in %s: %s", name, exc, exc_info=True)
 
         # Build detailed error message for the LLM
         tb_lines = traceback.format_exc().splitlines()

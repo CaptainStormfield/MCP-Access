@@ -680,7 +680,11 @@ TOOLS = [
     # -- Output report -------------------------------------------------------
     types.Tool(
         name="access_output_report",
-        description="Exports a report to PDF, XLSX, RTF or TXT. output_path auto-generated if omitted.",
+        description=(
+            "Exports a report to PDF, XLSX, RTF or TXT. output_path "
+            "auto-generated if omitted. Refuses to overwrite an existing "
+            "file unless overwrite=true."
+        ),
         inputSchema={
             "type": "object",
             "properties": {
@@ -688,6 +692,10 @@ TOOLS = [
                 "report_name": {"type": "string", "description": "Report name"},
                 "output_path": {"type": "string", "description": "Output path (auto if omitted)"},
                 "format": {"type": "string", "default": "pdf", "description": "pdf, xlsx, rtf, txt"},
+                "overwrite": {
+                    "type": "boolean", "default": False,
+                    "description": "Replace existing file. Default false — prevents accidental clobber.",
+                },
             },
             "required": ["db_path", "report_name"],
         },
@@ -905,12 +913,19 @@ TOOLS = [
     # -- Delete relationship -------------------------------------------------
     types.Tool(
         name="access_delete_relationship",
-        description="Deletes a relationship between tables by name.",
+        description=(
+            "Deletes a relationship between tables by name. "
+            "Requires confirm=true — this is irreversible."
+        ),
         inputSchema={
             "type": "object",
             "properties": {
                 "db_path": {"type": "string", "description": "Path to .accdb/.mdb file"},
                 "name": {"type": "string", "description": "Name of the relationship to delete"},
+                "confirm": {
+                    "type": "boolean", "default": False,
+                    "description": "Must be true to actually delete — safety guard.",
+                },
             },
             "required": ["db_path", "name"],
         },
@@ -936,6 +951,70 @@ TOOLS = [
                               "description": "true = interpret search_text as regex"},
             },
             "required": ["db_path", "search_text"],
+        },
+    ),
+    # -- Find definition (Go To Definition for VBA symbols) -----------------
+    types.Tool(
+        name="access_find_definition",
+        description=(
+            "Go-to-definition for a VBA symbol — the mirror of access_find_usages. "
+            "Scans every standard module, form code-behind and report code-behind "
+            "for DECLARATIONS of `symbol` and returns where each lives "
+            "(object_type, object_name, line, declaration, scope, value if constant). "
+            "Detects: const, enum, enum_member, type, type_field, sub, function, "
+            "property (Get/Let/Set, incl. Default Property), declare (Win32 API), "
+            "and module-level variable. Handles multi-const lines (Const A=1, B=2) "
+            "and joins VBA line continuations (` _` at end of line). "
+            "Use this when you need the value of a constant/enum member, or the source "
+            "of a procedure, before deciding what to edit next. Case-insensitive by default."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "db_path": {"type": "string", "description": "Path to .accdb/.mdb file"},
+                "symbol": {
+                    "type": "string",
+                    "description": "Name to resolve (e.g. 'dbAccess', 'ccRed', 'ProcessInvoices')",
+                },
+                "kinds": {
+                    "type": "array",
+                    "items": {
+                        "type": "string",
+                        "enum": [
+                            "const", "enum", "enum_member", "type", "type_field",
+                            "sub", "function", "property", "declare", "variable",
+                        ],
+                    },
+                    "description": (
+                        "Optional whitelist. Default: all kinds. "
+                        "E.g. ['const','enum_member'] to resolve only constant-like names."
+                    ),
+                },
+                "match_case": {
+                    "type": "boolean", "default": False,
+                    "description": "VBA is case-insensitive, so leave False unless you know otherwise.",
+                },
+                "scan_types": {
+                    "type": "array",
+                    "items": {"type": "string", "enum": ["module", "form", "report"]},
+                    "description": (
+                        "Which object types to scan. Default: all three. "
+                        "Pass ['module'] when you know the symbol is a public "
+                        "declaration in a standard module — it's much faster "
+                        "on large DBs because scanning form/report code-behind "
+                        "triggers a Design-view open/close when the VBE cache "
+                        "is cold."
+                    ),
+                },
+                "first_only": {
+                    "type": "boolean", "default": False,
+                    "description": (
+                        "Stop after the first match. Useful for unique names "
+                        "in big databases."
+                    ),
+                },
+            },
+            "required": ["db_path", "symbol"],
         },
     ),
     # -- Batch SQL -----------------------------------------------------------
