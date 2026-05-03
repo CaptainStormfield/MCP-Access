@@ -447,7 +447,7 @@ def _exec_single_replace(cm, app, object_type, object_name, start_line, count, n
         decoded = html_mod.unescape(new_code)
         normalized = decoded.replace("\r\n", "\n").replace("\r", "\n").replace("\n", "\r\n")
         cm.InsertLines(start_line, normalized)
-        inserted = len(decoded.splitlines())
+        inserted = cm.CountOfLines - (total - count)  # exact: VBE counts trailing blank from trailing \r\n
     end = start_line + count - 1 if count > 0 else start_line
     clamp_note = " (count adjusted)" if clamped else ""
     return {
